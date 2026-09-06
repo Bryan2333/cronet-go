@@ -1,0 +1,144 @@
+name: Build sing-box for macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      naive_repository:
+        description: naiveproxy repository
+        required: false
+        default: https://github.com/kinmeic/naiveproxy.git
+        type: string
+      naive_tag:
+        description: naiveproxy tag
+        required: true
+        type: string
+      sing_box_tag:
+        description: sing-box tag
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: macOS ${{ matrix.arch }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64]
+    env:
+      NAIVE_REPOSITORY: ${{ inputs.naive_repository }}
+      NAIVE_TAG: ${{ inputs.naive_tag }}
+      SING_BOX_REPOSITORY: https://github.com/reF1nd/sing-box.git
+      SING_BOX_TAG: ${{ inputs.sing_box_tag }}
+
+    steps:
+      - name: Checkout cronet-go
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.25.12
+          cache: false
+
+      - name: Install build tools
+        run: brew install ninja ccache iperf3
+
+      - name: Checkout naiveproxy base
+        run: |
+           test -f patches/naiveproxy-cronet.patch
+           rm -rf naiveproxy
+           git clone --filter=blob:none --no-checkout "$NAIVE_REPOSITORY" naiveproxy
+           git -C naiveproxy fetch --depth=1 origin "refs/tags/$NAIVE_TAG:refs/tags/$NAIVE_TAG"
+           git -C naiveproxy checkout --detach "refs/tags/$NAIVE_TAG"
+           git -C naiveproxy apply --check ../patches/naiveproxy-cronet.patch
+           git -C naiveproxy apply ../patches/naiveproxy-cronet.patch
+
+      - name: Update Chromium version test
+        run: |
+           chromium_version=$(tr -d '\r\n' < naiveproxy/CHROMIUM_VERSION)
+           sed -i '' -E "s/(require\.Equal\(t, )\"[^\"]*\"(, engine\.Version\(\)\))$/\1\"$chromium_version\"\2/" test/engine_test.go
+
+      - name: Checkout sing-box
+        run: |
+          git clone --filter=blob:none --no-checkout "$SING_BOX_REPOSITORY" sing-box
+          git -C sing-box fetch --depth=1 origin "refs/tags/$SING_BOX_TAG:refs/tags/$SING_BOX_TAG"
+          git -C sing-box checkout --detach "refs/tags/$SING_BOX_TAG"
+
+      - name: Configure local Cronet modules
+        run: |
+          all_directory="$GITHUB_WORKSPACE/.cronet-all"
+          mkdir -p "$all_directory"
+          cat > "$all_directory/go.mod" <<'EOF'
+          module github.com/sagernet/cronet-go/all
+
+          go 1.24
+
+          require github.com/sagernet/cronet-go v0.0.0
+          EOF
+          cat > "$all_directory/darwin_${{ matrix.arch }}.go" <<EOF
+          //go:build darwin && !ios && ${{ matrix.arch }}
+
+          package all
+
+          import _ "github.com/sagernet/cronet-go"
+          EOF
+
+          cd sing-box
+          go mod edit "-replace=github.com/sagernet/cronet-go=$GITHUB_WORKSPACE"
+          go mod edit "-replace=github.com/sagernet/cronet-go/all=$all_directory"
+          go mod tidy
+
+      - name: Build Cronet static library
+        run: |
+           go run ./cmd/build-naive --target=darwin/${{ matrix.arch }} build
+           go run ./cmd/build-naive --target=darwin/${{ matrix.arch }} package --local
+
+      - name: Run Cronet integration tests
+        run: go -C test test -v -timeout=12m
+
+      - name: Build sing-box
+        working-directory: sing-box
+        env:
+          CGO_ENABLED: 1
+          GOOS: darwin
+          GOARCH: ${{ matrix.arch }}
+        run: |
+           mkdir -p dist
+           build_tags=$(cat release/DEFAULT_BUILD_TAGS)
+           ldflags=$(cat release/LDFLAGS)
+           version="${SING_BOX_TAG#v}"
+           go build -trimpath -tags "$build_tags" \
+             -ldflags "-X github.com/sagernet/sing-box/constant.Version=$version $ldflags -s -w -buildid=" \
+             -o "dist/sing-box-darwin-${{ matrix.arch }}" ./cmd/sing-box
+
+      - name: Smoke test sing-box
+        working-directory: sing-box
+        run: ./dist/sing-box-darwin-${{ matrix.arch }} version
+
+      - name: Publish sing-box release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="sing-box/dist/sing-box-darwin-${{ matrix.arch }}"
+          release_tag="$NAIVE_TAG"
+          release_note="sing-box version: $SING_BOX_TAG"
+
+          if gh release view "$release_tag" &>/dev/null; then
+            echo "Release $release_tag exists, uploading asset..."
+            release_body=$(gh release view "$release_tag" --json body --jq .body)
+            if [[ "$release_body" != *"$release_note"* ]]; then
+              [[ -n "$release_body" ]] && release_body+=$'\n\n'
+              gh release edit "$release_tag" --notes "$release_body$release_note"
+            fi
+          else
+            echo "Creating release $release_tag..."
+            gh release create "$release_tag" \
+              --title "$release_tag" \
+              --notes "$release_note"
+          fi
+
+          gh release upload "$release_tag" "$asset" --clobber
