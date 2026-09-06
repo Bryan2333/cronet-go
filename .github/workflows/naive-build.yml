@@ -7,10 +7,6 @@ on:
         description: 'Release tag'
         type: string
         required: false
-  push:
-    branches: [main, dev]
-  pull_request:
-    branches: [main, dev]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
