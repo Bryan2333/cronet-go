@@ -222,6 +222,13 @@ SystemTrustStore 新增的纯虚函数。
 
 ## 7. Build And Test
 
+编译前先应用仅用于构建机的 sccache 检测补丁。每个 target 工作树只需应用一次；以下命令可重复执行，已应用时会跳过：
+
+```bash
+git -C naiveproxy apply --reverse --check ../patches/sccache-detection.patch 2>/dev/null || \
+  git -C naiveproxy apply ../patches/sccache-detection.patch
+```
+
 构建工具从 `cronet-go` 根目录的 `naiveproxy/` 读取源码：
 
 ```bash
@@ -260,6 +267,9 @@ UDP/QUIC 路径成功（如果启用）。
 编译和测试通过后，检查 `naiveproxy/` 只包含 target 基线加 Cronet 改动：
 
 ```bash
+# sccache-detection.patch 只用于构建，不得进入最终 Cronet patch。
+# 反向应用只撤销该补丁的 hunk，会保留同文件中的其他改动。
+git -C naiveproxy apply --reverse ../patches/sccache-detection.patch
 git -C naiveproxy add src
 git -C naiveproxy diff --cached --name-status <target-tag> -- src
 ```
@@ -271,7 +281,11 @@ git -C naiveproxy diff --cached --name-status <target-tag> -- src
 git -C naiveproxy diff --cached --binary <target-tag> -- src \
   > <cronet-go-root>/patches/naiveproxy-cronet.patch
 git -C naiveproxy reset
+git -C naiveproxy apply ../patches/sccache-detection.patch
 ```
+
+最后一条命令必须执行，以便继续使用已应用 sccache 补丁的工作树编译；生成的
+`naiveproxy-cronet.patch` 不包含 `sccache-detection.patch` 的改动。
 
 `git diff --check` 只作为代码审查辅助，不要为了消除提示而改写上游原样
 导入的证书、测试数据、模板或其他 fixture；最终 patch 应保持这些文件的

@@ -1,0 +1,36 @@
+diff --git a/src/build.sh b/src/build.sh
+index 20d729b67..b0ab59670 100755
+--- a/src/build.sh
++++ b/src/build.sh
+@@ -35,7 +35,9 @@ case "$host_os" in
+     fi
+   ;;
+   win)
+-    if [ -f "$HOME"/.cargo/bin/sccache* ]; then
++    if command -v sccache >/dev/null 2>&1; then
++      CCACHE=sccache
++    elif [ -f "$HOME"/.cargo/bin/sccache* ]; then
+       export PATH="$PATH:$HOME/.cargo/bin"
+       CCACHE=sccache
+     fi
+diff --git a/src/get-clang.sh b/src/get-clang.sh
+index c6536ef9a..079caab3d 100755
+--- a/src/get-clang.sh
++++ b/src/get-clang.sh
+@@ -34,10 +34,12 @@ if [ ! -d third_party/llvm-build/Release+Asserts/bin ]; then
+ fi
+
+ # sccache
+-if [ "$host_os" = win -a ! -f ~/.cargo/bin/sccache.exe ]; then
+-  sccache_url="https://github.com/mozilla/sccache/releases/download/0.2.12/sccache-0.2.12-x86_64-pc-windows-msvc.tar.gz"
+-  mkdir -p ~/.cargo/bin
+-  curl -L "$sccache_url" | tar xzf - --strip=1 -C ~/.cargo/bin
++if [ "$host_os" = win ] && ! command -v sccache >/dev/null 2>&1; then
++  if [ ! -f ~/.cargo/bin/sccache.exe ]; then
++    sccache_url="https://github.com/mozilla/sccache/releases/download/0.2.12/sccache-0.2.12-x86_64-pc-windows-msvc.tar.gz"
++    mkdir -p ~/.cargo/bin
++    curl -L "$sccache_url" | tar xzf - --strip=1 -C ~/.cargo/bin
++  fi
+ fi
+
+ # GN

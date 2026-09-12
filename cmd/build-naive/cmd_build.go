@@ -319,6 +319,14 @@ func buildTarget(t Target) {
 
 	if runtime.GOOS == "windows" {
 		sccachePath, _ := exec.LookPath("sccache")
+		if sccachePath == "" {
+			if userHome, err := os.UserHomeDir(); err == nil {
+				candidate := filepath.Join(userHome, ".cargo", "bin", "sccache.exe")
+				if _, err := os.Stat(candidate); err == nil {
+					sccachePath = candidate
+				}
+			}
+		}
 		if sccachePath != "" {
 			args = append(args, fmt.Sprintf(`cc_wrapper="%s"`, sccachePath))
 		}
