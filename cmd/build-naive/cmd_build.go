@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -16,13 +17,31 @@ var commandBuild = &cobra.Command{
 	Use:   "build",
 	Short: "Build cronet_static for specified targets",
 	Run: func(cmd *cobra.Command, args []string) {
+		jobs, err := cmd.Flags().GetInt("jobs")
+		if err != nil {
+			log.Fatal(err)
+		}
+		if jobs < 0 {
+			log.Fatalf("invalid jobs: %d (must be >= 0, 0 means ninja default)", jobs)
+		}
 		targets := parseTargets()
-		build(targets)
+		build(targets, jobs)
 	},
 }
 
 func init() {
+	commandBuild.Flags().IntP("jobs", "j", 0, "Max parallel ninja jobs per target (0 means ninja default: CPU cores + 2)")
 	mainCommand.AddCommand(commandBuild)
+}
+
+func runNinja(jobs int, outputDirectory string, ninjaTarget string) {
+	args := []string{"-C", outputDirectory}
+	if jobs > 0 {
+		args = append(args, "-j", strconv.Itoa(jobs))
+	}
+	args = append(args, ninjaTarget)
+	log.Printf("Running: ninja %s", strings.Join(args, " "))
+	runCommand(srcRoot, "ninja", args...)
 }
 
 func formatTargetLog(t Target) string {
@@ -53,12 +72,12 @@ func getOutputDirectory(t Target) string {
 	return fmt.Sprintf("out/cronet-%s-%s", t.OS, t.CPU)
 }
 
-func build(targets []Target) {
+func build(targets []Target, jobs int) {
 	log.Printf("Building cronet_static for %d target(s)", len(targets))
 
 	for _, t := range targets {
 		log.Printf("Building %s...", formatTargetLog(t))
-		buildTarget(t)
+		buildTarget(t, jobs)
 	}
 
 	log.Print("Build complete!")
@@ -227,7 +246,7 @@ func runGetClang(t Target) {
 	}
 }
 
-func buildTarget(t Target) {
+func buildTarget(t Target, jobs int) {
 	runGetClang(t)
 
 	outputDirectory := getOutputDirectory(t)
@@ -352,16 +371,13 @@ func buildTarget(t Target) {
 
 	if t.GOOS == "windows" {
 		// Windows: only build DLL (static linking not supported - Chromium uses MSVC, Go CGO only supports MinGW)
-		log.Printf("Running: ninja -C %s cronet", outputDirectory)
-		runCommand(srcRoot, "ninja", "-C", outputDirectory, "cronet")
+		runNinja(jobs, outputDirectory, "cronet")
 	} else {
-		log.Printf("Running: ninja -C %s cronet_static", outputDirectory)
-		runCommand(srcRoot, "ninja", "-C", outputDirectory, "cronet_static")
+		runNinja(jobs, outputDirectory, "cronet_static")
 
 		// For Linux glibc, also build shared library for purego mode and release distribution
 		if t.GOOS == "linux" && t.Libc != "musl" {
-			log.Printf("Running: ninja -C %s cronet", outputDirectory)
-			runCommand(srcRoot, "ninja", "-C", outputDirectory, "cronet")
+			runNinja(jobs, outputDirectory, "cronet")
 		}
 	}
 }
