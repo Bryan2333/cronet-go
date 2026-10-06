@@ -1,0 +1,160 @@
+name: Build sing-box macOS arm64 core
+
+on:
+  workflow_dispatch:
+    inputs:
+      singbox_repo:
+        description: 'sing-box repository URL'
+        required: true
+        default: 'https://github.com/reF1nd/sing-box'
+        type: string
+      singbox_ref:
+        description: 'sing-box tag / branch / commit'
+        required: true
+        default: 'testing'
+        type: string
+      extra_build_tags:
+        description: 'Extra build tags appended to release/DEFAULT_BUILD_TAGS'
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.singbox_ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 360
+    env:
+      TARGET: darwin/arm64
+      SINGBOX_DIR: sing-box
+    steps:
+      - name: Checkout cronet-go
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ^1.25
+
+      - name: Get naiveproxy commit
+        id: naive
+        run: echo "commit=$(git -C naiveproxy rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Get Chromium version
+        id: chromium
+        run: echo "version=$(cat naiveproxy/CHROMIUM_VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Chromium build cache
+        id: build-cache
+        uses: actions/cache@v6
+        with:
+          path: naiveproxy/src/out
+          key: naive-build-${{ steps.naive.outputs.commit }}-${{ hashFiles('cmd/build-naive/cmd_build.go', 'cmd/build-naive/cmd.go') }}-darwin-arm64
+
+      - name: Restore ccache
+        if: steps.build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v6
+        with:
+          path: ~/Library/Caches/ccache
+          key: ccache-darwin-darwin-arm64-${{ steps.chromium.outputs.version }}
+          restore-keys: ccache-darwin-darwin-arm64-
+
+      - name: Install tools
+        run: brew install ninja ccache iperf3
+
+      - name: Reset ccache stats
+        if: steps.build-cache.outputs.cache-hit != 'true'
+        run: ccache -z
+
+      - name: Build libcronet (darwin/arm64)
+        if: steps.build-cache.outputs.cache-hit != 'true'
+        run: go run ./cmd/build-naive --target=darwin/arm64 build
+
+      - name: Show ccache stats
+        if: steps.build-cache.outputs.cache-hit != 'true'
+        run: ccache -s
+
+      - name: Package libraries
+        run: |
+          go run ./cmd/build-naive --target=darwin/arm64 package --local
+          go run ./cmd/build-naive --target=darwin/arm64 package
+          ls -la lib/darwin_arm64/
+
+      - name: Run cronet-go test suite
+        env:
+          CGO_ENABLED: 1
+        run: |
+          set -euo pipefail
+          go test -v -timeout=10m .
+          cd test
+          go test -v -timeout=25m
+
+      - name: Checkout sing-box
+        env:
+          SINGBOX_REPO: ${{ inputs.singbox_repo }}
+          SINGBOX_REF: ${{ inputs.singbox_ref }}
+        run: |
+          set -euo pipefail
+          git clone "$SINGBOX_REPO" "$SINGBOX_DIR"
+          git -C "$SINGBOX_DIR" checkout --detach "$SINGBOX_REF"
+          git -C "$SINGBOX_DIR" describe --tags --always
+
+      # Link the archive once, through all -> lib/darwin_arm64.
+      - name: Wire cronet-go into sing-box
+        working-directory: ${{ env.SINGBOX_DIR }}
+        run: |
+          set -euo pipefail
+          rm -f "$GITHUB_WORKSPACE/lib_darwin_arm64_cgo.go"
+          go mod edit -replace "github.com/sagernet/cronet-go=$GITHUB_WORKSPACE"
+          go mod edit -replace "github.com/sagernet/cronet-go/lib/darwin_arm64=$GITHUB_WORKSPACE/lib/darwin_arm64"
+          grep -E 'cronet-go.*=>' go.mod
+
+      - name: Build sing-box core (darwin/arm64)
+        working-directory: ${{ env.SINGBOX_DIR }}
+        env:
+          CGO_ENABLED: '1'
+          GOOS: darwin
+          GOARCH: arm64
+          GOFLAGS: -mod=mod
+          EXTRA_TAGS: ${{ inputs.extra_build_tags }}
+        run: |
+          set -euo pipefail
+          TAGS="$(cat release/DEFAULT_BUILD_TAGS)"
+          if [ -n "$EXTRA_TAGS" ]; then
+            TAGS="$TAGS,$EXTRA_TAGS"
+          fi
+          echo "tags: $TAGS"
+          make build TAGS="$TAGS"
+          mkdir -p dist
+          mv sing-box dist/sing-box
+
+      - name: Smoke test sing-box core
+        working-directory: ${{ env.SINGBOX_DIR }}
+        run: |
+          set -euo pipefail
+          ./dist/sing-box version
+          ./dist/sing-box version | grep -q 'with_naive_outbound' \
+            || { echo 'with_naive_outbound missing from build tags'; exit 1; }
+          otool -L dist/sing-box
+          if otool -L dist/sing-box | grep -q libcronet; then
+            echo 'libcronet is a dylib dependency, expected static linking'
+            exit 1
+          fi
+          shasum -a 256 dist/sing-box | tee dist/sing-box.sha256
+
+      - name: Upload sing-box core
+        uses: actions/upload-artifact@v7
+        with:
+          name: sing-box-core-darwin-arm64
+          path: |
+            ${{ env.SINGBOX_DIR }}/dist/sing-box
+            ${{ env.SINGBOX_DIR }}/dist/sing-box.sha256
+          if-no-files-found: error
