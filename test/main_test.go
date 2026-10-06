@@ -37,10 +37,21 @@ import (
 )
 
 const (
-	naiveServerPort = 10443
-	iperf3Port      = 5201
-	forwardPort     = 15201
+	iperf3Port  = 5201
+	forwardPort = 15201
 )
+
+// naiveServerPort is the port the test naive server listens on. It can be
+// overridden with CRONET_TEST_NAIVE_PORT to avoid clashing with an already
+// running server on the default port.
+var naiveServerPort = func() uint16 {
+	if value := strings.TrimSpace(os.Getenv("CRONET_TEST_NAIVE_PORT")); value != "" {
+		if port, err := strconv.Atoi(value); err == nil && port > 0 && port <= 65535 {
+			return uint16(port)
+		}
+	}
+	return 10443
+}()
 
 const naiveServerVersion = "1.13.15"
 
@@ -410,6 +421,8 @@ func startNaiveServer(t *testing.T, certPem, keyPem string) {
 
 	config := strings.ReplaceAll(string(configTemplate), "/cert.pem", certPem)
 	config = strings.ReplaceAll(config, "/key.pem", keyPem)
+	// Keep the listening port in sync with the (possibly overridden) test port.
+	config = strings.Replace(config, `"listen_port": 10443`, fmt.Sprintf(`"listen_port": %d`, naiveServerPort), 1)
 
 	// Write to temp config file
 	configPath := filepath.Join(t.TempDir(), "sing-box.json")

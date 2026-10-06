@@ -85,8 +85,17 @@ func (c *BidirectionalConn) waitReady(waitHeaders bool, deadline <-chan struct{}
 }
 
 func (c *BidirectionalConn) Start(method string, url string, headers map[string]string, priority int, endOfStream bool) error {
+	fields := make([]HeaderField, 0, len(headers))
+	for name, value := range headers {
+		fields = append(fields, HeaderField{Name: name, Value: value})
+	}
+	return c.StartWithHeaders(method, url, fields, priority, endOfStream)
+}
+
+// StartWithHeaders is Start with an explicit header order.
+func (c *BidirectionalConn) StartWithHeaders(method string, url string, headers []HeaderField, priority int, endOfStream bool) error {
 	c.access.Lock()
-	if !c.stream.Start(method, url, headers, priority, endOfStream) {
+	if !c.stream.startHeaders(method, url, headers, priority, endOfStream) {
 		c.access.Unlock()
 		c.terminate(os.ErrInvalid)
 		return os.ErrInvalid

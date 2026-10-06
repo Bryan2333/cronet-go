@@ -3,6 +3,8 @@ module github.com/sagernet/cronet-go/test
 go 1.24.0
 
 require (
+	github.com/andybalholm/brotli v1.2.6
+	github.com/klauspost/compress v1.19.0
 	github.com/miekg/dns v1.1.72
 	github.com/sagernet/cronet-go v0.0.0
 	github.com/sagernet/sing v0.8.9

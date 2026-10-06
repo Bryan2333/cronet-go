@@ -40,6 +40,15 @@ func (s BidirectionalStream) Destroy() bool {
 
 // Start starts the stream by sending request to |url| using |method| and |headers|.
 func (c BidirectionalStream) Start(method string, url string, headers map[string]string, priority int, endOfStream bool) bool {
+	fields := make([]HeaderField, 0, len(headers))
+	for name, value := range headers {
+		fields = append(fields, HeaderField{Name: name, Value: value})
+	}
+	return c.startHeaders(method, url, fields, priority, endOfStream)
+}
+
+// startHeaders is Start with an explicit header order.
+func (c BidirectionalStream) startHeaders(method string, url string, headers []HeaderField, priority int, endOfStream bool) bool {
 	var headerArrayPtr uintptr
 	var cStringBacking [][]byte // Keep C string backing slices alive
 
@@ -47,14 +56,12 @@ func (c BidirectionalStream) Start(method string, url string, headers map[string
 	if headerLen > 0 {
 		// Allocate header structs
 		headerStructs := make([]bidirectionalStreamHeader, headerLen)
-		var index int
-		for key, value := range headers {
-			keyPtr, keyBacking := cronet.CString(key)
-			valuePtr, valueBacking := cronet.CString(value)
+		for index, header := range headers {
+			keyPtr, keyBacking := cronet.CString(header.Name)
+			valuePtr, valueBacking := cronet.CString(header.Value)
 			cStringBacking = append(cStringBacking, keyBacking, valueBacking)
 			headerStructs[index].key = keyPtr
 			headerStructs[index].value = valuePtr
-			index++
 		}
 
 		headerArray := bidirectionalStreamHeaderArray{

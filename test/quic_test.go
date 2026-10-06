@@ -256,6 +256,9 @@ func TestNaiveQUICDomainNon443ECHHTTPSDNSDelayAffectsHandshake(t *testing.T) {
 		DNSResolver:             dnsResolver,
 		ECHEnabled:              true,
 		QUIC:                    true,
+		// This test measures the DNS delay during the handshake; the preamble
+		// would consume that lookup before the tunnel request is sent.
+		DisablePreamble: true,
 	})
 	require.NoError(t, err)
 	require.NoError(t, client.Start())

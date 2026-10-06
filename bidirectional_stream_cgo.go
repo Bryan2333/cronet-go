@@ -76,6 +76,16 @@ func (c BidirectionalStream) DelayRequestHeadersUntilFlush(delay bool) {
 // |method| is HTTP verb.
 // noinspection GoDeferInLoop
 func (c BidirectionalStream) Start(method string, url string, headers map[string]string, priority int, endOfStream bool) bool {
+	fields := make([]HeaderField, 0, len(headers))
+	for name, value := range headers {
+		fields = append(fields, HeaderField{Name: name, Value: value})
+	}
+	return c.startHeaders(method, url, fields, priority, endOfStream)
+}
+
+// startHeaders is Start with an explicit header order.
+// noinspection GoDeferInLoop
+func (c BidirectionalStream) startHeaders(method string, url string, headers []HeaderField, priority int, endOfStream bool) bool {
 	var headerArray C.bidirectional_stream_header_array
 	headerLen := len(headers)
 	if headerLen > 0 {
@@ -83,15 +93,13 @@ func (c BidirectionalStream) Start(method string, url string, headers map[string
 		defer C.free(cHeadersPtr)
 		cType := (*C.bidirectional_stream_header)(cHeadersPtr)
 		cHeaders := unsafe.Slice(cType, headerLen)
-		var index int
-		for key, value := range headers {
-			cKey := C.CString(key)
+		for index, header := range headers {
+			cKey := C.CString(header.Name)
 			defer C.free(unsafe.Pointer(cKey))
-			cValue := C.CString(value)
+			cValue := C.CString(header.Value)
 			defer C.free(unsafe.Pointer(cValue))
 			cHeaders[index].key = cKey
 			cHeaders[index].value = cValue
-			index++
 		}
 		headerArray = C.bidirectional_stream_header_array{
 			C.size_t(headerLen), C.size_t(headerLen), &cHeaders[0],

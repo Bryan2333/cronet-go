@@ -108,6 +108,12 @@ type BidirectionalStream struct {
 	ptr uintptr
 }
 
+// HeaderField is a single request header, preserving its order.
+type HeaderField struct {
+	Name  string
+	Value string
+}
+
 // HTTPHeader represents an HTTP header key-value pair.
 type HTTPHeader struct {
 	ptr uintptr

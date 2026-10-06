@@ -8,8 +8,11 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/bufio"
@@ -72,6 +75,14 @@ type NaiveClient struct {
 	singleEngine             bool
 	engines                  []Engine
 	streamEngines            []StreamEngine
+	preambles                []*preambleState
+	disablePreamble          bool
+	preambleTimeout          time.Duration
+	tunnelTimeout            time.Duration
+	preambleUserAgent        string
+	rootReferer              string
+	hints                    clientHints
+	hintsOnce                sync.Once
 	activeConnections        sync.WaitGroup
 	proxyWaitGroup           sync.WaitGroup
 	proxyCancel              context.CancelFunc
@@ -98,6 +109,10 @@ type NaiveClientOptions struct {
 	QUIC                     bool
 	QUICCongestionControl    QUICCongestionControl
 	QUICSessionReceiveWindow uint64
+	DisablePreamble          bool
+	PreambleTimeout          time.Duration
+	TunnelTimeout            time.Duration
+	PreambleUserAgent        string
 }
 
 func NewNaiveClient(config NaiveClientOptions) (*NaiveClient, error) {
@@ -120,6 +135,25 @@ func NewNaiveClient(config NaiveClientOptions) (*NaiveClient, error) {
 	serverURL := &url.URL{
 		Scheme: "https",
 		Host:   net.JoinHostPort(serverName, F.ToString(config.ServerAddress.Port)),
+	}
+
+	rootHost := serverURL.Host
+	if config.ServerAddress.Port == 443 {
+		rootHost = strings.TrimSuffix(rootHost, ":443")
+	}
+	rootReferer := F.ToString("https://", rootHost, "/")
+
+	tunnelTimeout := config.TunnelTimeout
+	if tunnelTimeout <= 0 {
+		if runtime.GOOS == "android" {
+			tunnelTimeout = 10 * time.Minute
+		} else {
+			tunnelTimeout = 30 * time.Minute
+		}
+	}
+	preambleTimeout := config.PreambleTimeout
+	if preambleTimeout <= 0 {
+		preambleTimeout = 10 * time.Second
 	}
 
 	var authorization string
@@ -169,6 +203,11 @@ func NewNaiveClient(config NaiveClientOptions) (*NaiveClient, error) {
 		quicCongestionControl:    config.QUICCongestionControl,
 		receiveWindow:            config.ReceiveWindow,
 		quicSessionReceiveWindow: config.QUICSessionReceiveWindow,
+		disablePreamble:          config.DisablePreamble,
+		preambleTimeout:          preambleTimeout,
+		tunnelTimeout:            tunnelTimeout,
+		preambleUserAgent:        config.PreambleUserAgent,
+		rootReferer:              rootReferer,
 		started:                  make(chan struct{}),
 	}, nil
 }
@@ -353,6 +392,16 @@ func (c *NaiveClient) Start() error {
 
 	c.engines = engines
 	c.streamEngines = common.Map(engines, Engine.StreamEngine)
+	if !c.disablePreamble {
+		c.preambles = make([]*preambleState, c.concurrency)
+		for slot := range c.preambles {
+			engineIndex := 0
+			if len(c.streamEngines) > 1 {
+				engineIndex = slot
+			}
+			c.preambles[slot] = newPreambleState(c, c.streamEngines[engineIndex], slot)
+		}
+	}
 
 	c.state.Store(uint32(clientStateRunning))
 	close(c.started)
@@ -366,6 +415,9 @@ func (c *NaiveClient) startEngine(tcpDialer Dialer, udpDialer UDPDialer, dnsServ
 		engine.Destroy()
 	}
 
+	// The version is known before StartWithParams, which needs the user agent.
+	c.prepareClientHints(engine.Version())
+
 	if c.trustedRootCertificates != "" {
 		if !engine.SetTrustedRootCertificates(c.trustedRootCertificates) {
 			destroyEngine()
@@ -377,6 +429,7 @@ func (c *NaiveClient) startEngine(tcpDialer Dialer, udpDialer UDPDialer, dnsServ
 	engine.SetUDPDialer(udpDialer)
 
 	params := NewEngineParams()
+	params.SetUserAgent(c.hints.userAgent)
 	if c.quicEnabled {
 		params.SetEnableQuic(true)
 	} else {
@@ -448,6 +501,17 @@ func (c *NaiveClient) CloseAllConnections() {
 	}
 }
 
+// sortedHeaderNames keeps user extra headers deterministic; a Go map cannot
+// carry the order they were configured in.
+func sortedHeaderNames(headers map[string]string) []string {
+	names := make([]string, 0, len(headers))
+	for name := range headers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 func (c *NaiveClient) DialEarly(ctx context.Context, destination M.Socksaddr) (NaiveConn, error) {
 	state := clientState(c.state.Load())
 	switch state {
@@ -464,31 +528,66 @@ func (c *NaiveClient) DialEarly(ctx context.Context, destination M.Socksaddr) (N
 			return nil, c.ctx.Err()
 		}
 	}
-	headers := map[string]string{
-		"-connect-authority": destination.String(),
-		"Padding":            generatePaddingHeader(),
-	}
-	if c.authorization != "" {
-		headers["proxy-authorization"] = c.authorization
-	}
-	if c.quicEnabled {
-		headers["-force-quic"] = "true"
-	}
-	for key, value := range c.extraHeaders {
-		headers[key] = value
-	}
-
 	streamEngine := c.streamEngines[0]
+	slot := 0
 	if c.concurrency > 1 {
-		concurrencyIndex := int(c.counter.Add(1) % uint64(c.concurrency))
+		slot = int(c.counter.Add(1) % uint64(c.concurrency))
 		if len(c.streamEngines) > 1 {
-			streamEngine = c.streamEngines[concurrencyIndex]
-		} else {
-			headers["-network-isolation-key"] = F.ToString("https://pool-", concurrencyIndex, ":443")
+			streamEngine = c.streamEngines[slot]
 		}
 	}
+
+	var isolationKey string
+	switch {
+	case len(c.preambles) > 0:
+		preamble := c.preambles[slot]
+		mode, epoch, wait := preamble.beginAttempt(time.Now())
+		switch mode {
+		case preambleModeFull:
+			preamble.runFull(ctx, epoch)
+			preamble.finishAttempt()
+		case preambleModeWait:
+			select {
+			case <-wait:
+			case <-ctx.Done():
+			}
+		case preambleModeOne:
+			c.proxyWaitGroup.Add(1)
+			go func() {
+				defer c.proxyWaitGroup.Done()
+				preamble.startOne(epoch)
+			}()
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		isolationKey = preamble.isolationKey(epoch)
+	case c.concurrency > 1 && len(c.streamEngines) == 1:
+		isolationKey = F.ToString("https://pool-", slot, ":443")
+	}
+
+	// The same order as the native client (ProxyClientSocket::BuildTunnelRequest).
+	headers := []HeaderField{
+		{"-connect-authority", destination.String()},
+		{"padding", generatePaddingHeader()},
+		{"padding-type-request", "1"},
+	}
+	for _, name := range sortedHeaderNames(c.extraHeaders) {
+		headers = append(headers, HeaderField{Name: name, Value: c.extraHeaders[name]})
+	}
+	headers = append(headers, HeaderField{"user-agent", c.hints.userAgent})
+	if c.authorization != "" {
+		headers = append(headers, HeaderField{"proxy-authorization", c.authorization})
+	}
+	if c.quicEnabled {
+		headers = append(headers, HeaderField{"-force-quic", "true"})
+	}
+	if isolationKey != "" {
+		headers = append(headers, HeaderField{"-network-isolation-key", isolationKey})
+	}
+
 	conn := streamEngine.CreateConn(ctx, c.logger, true, false)
-	err := conn.Start("CONNECT", c.serverURL, headers, 0, false)
+	err := conn.StartWithHeaders("CONNECT", c.serverURL, headers, 0, false)
 	if err != nil {
 		return nil, err
 	}
